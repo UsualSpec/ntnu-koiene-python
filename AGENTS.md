@@ -1,6 +1,6 @@
 # AGENTS.md
 
-"hütten" is a Python CLI that scrapes live NTNUI Koiene (Norwegian hiking cabin)
+"koiene" is a Python CLI that scrapes live NTNUI Koiene (Norwegian hiking cabin)
 availability and prints JSON. Small repo: one CLI + a `koiene/` package. No tests,
 no linter/CI config, no git repo.
 
