@@ -6,10 +6,13 @@ from dataclasses import dataclass, field
 @dataclass
 class DayAvailability:
     date: str
-    available_beds: int | None = None  # None = closed
+    available_beds: int | None = None  # Beds available for ordinary booking now.
+    listed_beds: int | None = None  # Calendar inventory, including unreleased dates.
+    booking_open: bool | None = None
+    status: str = "unknown"  # available, full, reserved, not_yet_open, unknown
 
     def __repr__(self) -> str:
-        beds = f"{self.available_beds} beds" if self.available_beds is not None else "closed"
+        beds = f"{self.available_beds} beds" if self.available_beds is not None else self.status
         return f"DayAvailability({self.date}, {beds})"
 
 
@@ -54,6 +57,8 @@ class Cabin:
     total_time_summer_min: int = 0
     total_time_winter_min: int = 0
     transport: str = ""
+    public_transport_min: int = 0
+    shortest_route_school_days_only: bool = False
     dates: list[DayAvailability] = field(default_factory=list)
 
     # From detail page

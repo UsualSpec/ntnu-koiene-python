@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta
-from urllib.parse import parse_qs, urlparse
+from datetime import datetime, timedelta, date
+from urllib.parse import parse_qs, urlparse, urljoin
 
 import requests
 from bs4 import BeautifulSoup, Tag
@@ -19,6 +19,7 @@ class KoieneClient:
     def __init__(self, session: requests.Session | None = None):
         self._session = session or requests.Session()
         self._session.headers["User-Agent"] = "hutten/0.1 (koiene-scraper)"
+        self.warnings: list[str] = []
         self._matrix_cache: dict[str, dict] | None = None
 
     def fetch_day(self, date: str) -> list[Cabin]:
@@ -37,6 +38,9 @@ class KoieneClient:
         start_dt = datetime.strptime(start, "%Y-%m-%d")
         end_dt = datetime.strptime(end, "%Y-%m-%d")
 
+        if end_dt < start_dt:
+            raise ValueError("End date must be on or after start date")
+        self.warnings = []
         cabins_by_name: dict[str, Cabin] = {}
         current = start_dt
         while current <= end_dt:
@@ -53,7 +57,11 @@ class KoieneClient:
             current += timedelta(days=1)
 
         for cabin in cabins_by_name.values():
-            cabin.dates = [d for d in cabin.dates if d.date in target_dates]
+            days = {d.date: d for d in cabin.dates if d.date in target_dates}
+            missing = set(target_dates) - days.keys()
+            if missing:
+                raise ValueError(f"Incomplete availability for {cabin.name}: {sorted(missing)}")
+            cabin.dates = [days[day] for day in target_dates]
             info = matrix.get(cabin.name)
             if not info:
                 km = re.search(r"k=([^&]+)", cabin.info_url)
@@ -77,6 +85,8 @@ class KoieneClient:
                 cabin.total_time_summer_min = info.get("total_time_summer_min", 0)
                 cabin.total_time_winter_min = info.get("total_time_winter_min", 0)
                 cabin.transport = info.get("transport", "")
+                cabin.public_transport_min = info.get("public_transport_min", 0)
+                cabin.shortest_route_school_days_only = info.get("shortest_route_school_days_only", False)
 
         self._enrich_prices(list(cabins_by_name.values()))
         return list(cabins_by_name.values())
@@ -88,10 +98,12 @@ class KoieneClient:
             try:
                 resp = self._session.get(
                     DETAIL_URL,
-                    params={"k": cabin.name, "d": "2026-08-18", "s": 1},
+                    params={"k": cabin.name, "d": date.today().isoformat(), "s": 1},
+                    timeout=30,
                 )
                 resp.raise_for_status()
-            except requests.RequestException:
+            except requests.RequestException as exc:
+                self.warnings.append(f"Prices unavailable for {cabin.name}: {exc}")
                 continue
             text = resp.text
             m = re.search(
@@ -111,9 +123,10 @@ class KoieneClient:
         k_param = km.group(1)
 
         try:
-            resp = self._session.get(DETAIL_PAGE_URL, params={"k": k_param, "l": 1})
+            resp = self._session.get(DETAIL_PAGE_URL, params={"k": k_param, "l": 1}, timeout=30)
             resp.raise_for_status()
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            self.warnings.append(f"Details unavailable for {cabin.name}: {exc}")
             return
 
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -367,7 +380,7 @@ class KoieneClient:
         if self._matrix_cache is not None:
             return self._matrix_cache
 
-        resp = self._session.get(MATRIX_URL)
+        resp = self._session.get(MATRIX_URL, timeout=30)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -380,6 +393,8 @@ class KoieneClient:
         if len(tables) >= 2:
             self._parse_difficulty_table(tables[1], result, k_to_name)
 
+        if not result or not any(v.get("difficulty") for v in result.values()):
+            raise ValueError("Cabin matrix could not be parsed")
         self._matrix_cache = result
         return result
 
@@ -460,7 +475,7 @@ class KoieneClient:
                     return int(m.group(1)) * 60 + int(m.group(2))
                 return 0
 
-            transport = cells[7].get_text(strip=True).replace("\n", " ") if len(cells) > 7 else ""
+            transport = cells[7].get_text(" ", strip=True) if len(cells) > 7 else ""
             pt_walking_summer = parse_time(cells[9].get_text()) if len(cells) > 9 else 0
             pt_total_summer = parse_time(cells[10].get_text()) if len(cells) > 10 else 0
             pt_walking_winter = parse_time(cells[11].get_text()) if len(cells) > 11 else 0
@@ -473,18 +488,21 @@ class KoieneClient:
                 result[name]["total_time_summer_min"] = pt_total_summer
                 result[name]["total_time_winter_min"] = pt_total_winter
                 result[name]["transport"] = transport
+                result[name]["public_transport_min"] = parse_time(cells[8].get_text()) if len(cells) > 8 else 0
+                result[name]["shortest_route_school_days_only"] = any("**" in cells[i].get_text() for i in (9, 11) if len(cells) > i)
 
     def _fetch_overview_window(
         self, start_date: str, cabins_by_name: dict[str, Cabin]
     ) -> None:
-        resp = self._session.get(OVERVIEW_URL, params={"startdato": start_date})
+        resp = self._session.get(OVERVIEW_URL, params={"startdato": start_date}, timeout=30)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
         table = soup.find("table", cellpadding="0")
         if not table:
-            return
+            raise ValueError(f"Availability table missing for {start_date}")
 
+        parsed_count = 0
         rows = table.find_all("tr")
         for row in rows:
             cells = row.find_all("td")
@@ -504,7 +522,7 @@ class KoieneClient:
             if cabin_name not in cabins_by_name:
                 cabins_by_name[cabin_name] = Cabin(
                     name=cabin_name,
-                    info_url=info_href,
+                    info_url=urljoin(OVERVIEW_URL, info_href),
                 )
             cabin = cabins_by_name[cabin_name]
 
@@ -533,13 +551,30 @@ class KoieneClient:
                 if not date_str:
                     continue
 
+                booking_open = {"ja": True, "nei": False}.get(aap)
+                kind = params.get("typ", [""])[0].casefold()
+                try:
+                    listed = int(led) if led is not None else None
+                except ValueError:
+                    listed = None
+                if listed is not None and listed < 0:
+                    listed = None
                 available = None
-                if aap == "ja" and led is not None:
-                    try:
-                        available = int(led)
-                    except ValueError:
-                        pass
-
-                cabin.dates.append(
-                    DayAvailability(date=date_str, available_beds=available)
-                )
+                if kind in {"full", "opptatt"}:
+                    status = "full" if kind == "full" else "reserved"
+                    listed = 0
+                    available = 0 if booking_open else None
+                elif booking_open is False:
+                    status = "not_yet_open"
+                elif booking_open and listed is not None:
+                    available = listed
+                    status = "available" if listed > 0 else "full"
+                else:
+                    status = "unknown"
+                cabin.dates.append(DayAvailability(
+                    date=date_str, available_beds=available, listed_beds=listed,
+                    booking_open=booking_open, status=status,
+                ))
+                parsed_count += 1
+        if not parsed_count:
+            raise ValueError(f"No availability cells parsed for {start_date}")

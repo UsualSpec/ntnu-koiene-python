@@ -1,149 +1,130 @@
 #!/usr/bin/env python3
-"""CLI for querying NTNUI Koiene cabin availability."""
+"""Query NTNUI cabins. All time limits are minutes; winter approaches may require skis."""
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
+from datetime import date, datetime, timezone
 import json
 import sys
-from datetime import date
 
-from koiene import KoieneClient, by_beds, by_beds_all, by_difficulty, by_price, any_available, by_walking_time, by_total_time
+from koiene import (KoieneClient, by_beds, by_beds_all, by_difficulty, by_price,
+                    any_available, by_walking_time, by_total_time, by_public_transport_time,
+                    by_capacity, by_altitude, by_terrain, by_amenity, available_stays)
+
+
+def positive(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be positive")
+    return number
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Query NTNUI Koiene cabin availability"
-    )
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
-        "--date",
-        help="Single date to query (YYYY-MM-DD, default: today)",
-    )
-    group.add_argument(
-        "--from",
-        dest="date_from",
-        help="Start date for range (YYYY-MM-DD)",
-    )
-    parser.add_argument(
-        "--to",
-        help="End date for range (YYYY-MM-DD, inclusive)",
-    )
-    parser.add_argument("--min-beds", type=int, help="Minimum available beds")
-    parser.add_argument("--require-all", action="store_true", help="Require min-beds on ALL dates (not just any)")
-    parser.add_argument("--max-price", type=int, help="Max price (member)")
-    parser.add_argument("--max-guest-price", type=int, help="Max price (guest)")
-    parser.add_argument(
-        "--max-difficulty", type=int, choices=range(1, 6), help="Max difficulty (1-5)"
-    )
-    parser.add_argument("--available-only", action="store_true", help="Only cabins with beds available")
-    parser.add_argument("--max-walking-time", type=int, metavar="MINUTES", help="Max walking time from bus stop (minutes, summer)")
-    parser.add_argument("--max-total-time", type=int, metavar="MINUTES", help="Max total travel time by PT (minutes, summer)")
-    parser.add_argument("--detail", action="store_true", help="Fetch full detail pages for each cabin")
+    parser = argparse.ArgumentParser(description=__doc__)
+    dates = parser.add_mutually_exclusive_group()
+    dates.add_argument("--date", help="One overnight date, default today")
+    dates.add_argument("--from", dest="date_from", help="First overnight date (YYYY-MM-DD)")
+    parser.add_argument("--to", help="Last overnight date, inclusive (YYYY-MM-DD)")
+    parser.add_argument("--min-beds", type=positive)
+    parser.add_argument("--require-all", action="store_true", help="Require beds on every queried date")
+    parser.add_argument("--max-price", type=positive)
+    parser.add_argument("--max-guest-price", type=positive)
+    parser.add_argument("--max-difficulty", type=int, choices=range(1, 6))
+    parser.add_argument("--available-only", action="store_true", help="At least one bed bookable now")
+    parser.add_argument("--season", choices=["summer", "winter"], default="summer")
+    parser.add_argument("--max-walking-time", type=positive, metavar="MINUTES", help="Approach from public transport")
+    parser.add_argument("--max-total-time", type=positive, metavar="MINUTES", help="Public transport plus approach")
+    parser.add_argument("--max-public-transport-time", type=positive, metavar="MINUTES", help="Vehicle/boat time only; published estimate has no seasonal split")
+    parser.add_argument("--strict-time-limits", action="store_true", help="Use < rather than <= for all time limits")
+    parser.add_argument("--exclude-school-bus", action="store_true", help="Exclude matrix routes flagged as school-days only")
+    parser.add_argument("--min-capacity", type=positive)
+    parser.add_argument("--min-altitude", type=positive, metavar="METRES")
+    parser.add_argument("--max-altitude", type=positive, metavar="METRES")
+    parser.add_argument("--terrain", choices=["F", "T", "M"], help="Forest, timberline, mountain")
+    parser.add_argument("--amenity", action="append", default=[], help="Require text in specialities; repeatable")
+    parser.add_argument("--name", action="append", default=[], help="Keep names containing any supplied text")
+    parser.add_argument("--exclude-name", action="append", default=[], help="Exclude names containing text; repeatable")
+    parser.add_argument("--nights", type=positive, help="Minimum consecutive nights; output matching stays")
+    parser.add_argument("--weekend", action="store_true", help="Friday check-in; defaults to two nights")
+    parser.add_argument("--whole-cabin", action="store_true", help="Require all beds for the stay")
+    parser.add_argument("--include-unreleased", action="store_true", help="For stay search only: include listed beds not yet released; NOT bookable now")
+    parser.add_argument("--detail", action="store_true")
     args = parser.parse_args()
-
-    if args.date_from and not args.to:
-        parser.error("--from requires --to")
-
-    target_date = args.date or date.today().isoformat()
+    if bool(args.date_from) != bool(args.to):
+        parser.error("--from and --to must be supplied together")
+    start = args.date_from or args.date or date.today().isoformat()
+    end = args.to or start
+    try:
+        if date.fromisoformat(end) < date.fromisoformat(start):
+            parser.error("--to must be on or after --from")
+    except ValueError:
+        parser.error("dates must use YYYY-MM-DD")
+    if args.min_altitude and args.max_altitude and args.min_altitude > args.max_altitude:
+        parser.error("minimum altitude exceeds maximum")
+    search_stays = bool(args.nights or args.weekend or args.whole_cabin)
+    if args.include_unreleased and not search_stays:
+        parser.error("--include-unreleased requires --nights, --weekend or --whole-cabin")
+    if args.require_all and not args.min_beds:
+        parser.error("--require-all requires --min-beds")
+    if args.include_unreleased and (args.require_all or args.available_only):
+        parser.error("--include-unreleased cannot be combined with bookable-only filters")
 
     client = KoieneClient()
-
-    if args.date_from:
-        cabins = client.fetch_range(args.date_from, args.to)
-    else:
-        cabins = client.fetch_day(target_date)
-
-    if args.min_beds:
-        if args.require_all:
-            cabins = by_beds_all(cabins, args.min_beds)
-        else:
-            cabins = by_beds(cabins, args.min_beds)
-    if args.max_price:
-        cabins = by_price(cabins, args.max_price, guest=False)
-    if args.max_guest_price:
-        cabins = by_price(cabins, args.max_guest_price, guest=True)
+    cabins = client.fetch_range(start, end)
     if args.max_difficulty:
         cabins = by_difficulty(cabins, args.max_difficulty)
+    summer = args.season == "summer"
+    for limit, fn in [(args.max_walking_time, by_walking_time), (args.max_total_time, by_total_time)]:
+        if limit:
+            cabins = fn(cabins, limit, summer=summer, strict=args.strict_time_limits)
+    if args.max_public_transport_time:
+        cabins = by_public_transport_time(cabins, args.max_public_transport_time, strict=args.strict_time_limits)
+    if args.exclude_school_bus:
+        cabins = [c for c in cabins if not c.shortest_route_school_days_only]
+    if args.min_capacity:
+        cabins = by_capacity(cabins, args.min_capacity)
+    if args.name:
+        cabins = [c for c in cabins if any(n.casefold() in c.name.casefold() for n in args.name)]
+    cabins = [c for c in cabins if not any(n.casefold() in c.name.casefold() for n in args.exclude_name)]
+    if args.terrain:
+        cabins = by_terrain(cabins, args.terrain)
+    for amenity in args.amenity:
+        cabins = by_amenity(cabins, amenity)
+    if args.max_price:
+        cabins = by_price(cabins, args.max_price)
+    if args.max_guest_price:
+        cabins = by_price(cabins, args.max_guest_price, guest=True)
     if args.available_only:
         cabins = any_available(cabins)
-    if args.max_walking_time:
-        cabins = by_walking_time(cabins, args.max_walking_time)
-    if args.max_total_time:
-        cabins = by_total_time(cabins, args.max_total_time)
-
-    if args.detail:
+    if args.min_beds and (not search_stays or args.require_all):
+        cabins = (by_beds_all if args.require_all else by_beds)(cabins, args.min_beds)
+    if args.detail or args.min_altitude or args.max_altitude:
         for cabin in cabins:
             client.fetch_detail(cabin)
-
-    output = {
-        "date": target_date,
-        "date_from": args.date_from,
-        "date_to": args.to,
-        "total_cabins": len(cabins),
-        "cabins": [
-            {
-                "name": c.name,
-                "info_url": c.info_url,
-                "capacity": c.capacity,
-                "table_places": c.table_places,
-                "year_built": c.year_built,
-                "terrain": c.terrain,
-                "difficulty": c.difficulty,
-                "difficulty_description": c.difficulty_description,
-                "price_member": c.price_member,
-                "price_guest": c.price_guest,
-                "bike": c.bike,
-                "summit_trip": c.summit_trip,
-                "hunting_fishing": c.hunting_fishing,
-                "guitar": c.guitar,
-                "waffle_iron": c.waffle_iron,
-                "specialities": c.specialities,
-                "walking_time_summer_min": c.walking_time_summer_min,
-                "walking_time_winter_min": c.walking_time_winter_min,
-                "total_time_summer_min": c.total_time_summer_min,
-                "total_time_winter_min": c.total_time_winter_min,
-                "transport": c.transport,
-                "dates": [
-                    {"date": d.date, "available_beds": d.available_beds}
-                    for d in c.dates
-                ],
-                # Detail page fields (only present if --detail)
-                **({"area": c.area} if c.area else {}),
-                **({"altitude": c.altitude} if c.altitude else {}),
-                **({"gps": {"latitude": c.gps_latitude, "longitude": c.gps_longitude}} if c.gps_latitude else {}),
-                **({"map_reference": c.map_reference} if c.map_reference else {}),
-                **({"map_name": c.map_name} if c.map_name else {}),
-                **({"weather_url": c.weather_url} if c.weather_url else {}),
-                **({"flickr_url": c.flickr_url} if c.flickr_url else {}),
-                **({"kml_url": c.kml_url} if c.kml_url else {}),
-                **({"images": c.images} if c.images else {}),
-                **({"cabin_description": c.cabin_description} if c.cabin_description else {}),
-                **({"route_description": c.route_description} if c.route_description else {}),
-                **({"parking_info": c.parking_info} if c.parking_info else {}),
-                **({"private_car": {
-                    "driving_min": c.private_car.driving_min,
-                    "summer_walking_min": c.private_car.summer_walking_min,
-                    "summer_total_min": c.private_car.summer_total_min,
-                    "winter_walking_min": c.private_car.winter_walking_min,
-                    "winter_total_min": c.private_car.winter_total_min,
-                }} if c.private_car.driving_min else {}),
-                **({"public_transport": {
-                    "type": c.pt_type,
-                    "driving_min": c.public_transport.driving_min,
-                    "summer_walking_min": c.public_transport.summer_walking_min,
-                    "summer_total_min": c.public_transport.summer_total_min,
-                    "winter_walking_min": c.public_transport.winter_walking_min,
-                    "winter_total_min": c.public_transport.winter_total_min,
-                }} if c.pt_type else {}),
-                **({"transport_options": [
-                    {"number": t.number, "route_via": t.route_via, "exit": t.exit}
-                    for t in c.transport_options
-                ]} if c.transport_options else {}),
-            }
-            for c in cabins
-        ],
-    }
-
+    if args.min_altitude or args.max_altitude:
+        cabins = by_altitude(cabins, args.min_altitude or 0, args.max_altitude)
+    records = []
+    for cabin in cabins:
+        record = asdict(cabin)
+        # Preserve the existing CLI's public-transport type field and GPS object.
+        record["public_transport"]["type"] = cabin.pt_type
+        if cabin.gps_latitude:
+            record["gps"] = {"latitude": cabin.gps_latitude, "longitude": cabin.gps_longitude}
+        if search_stays:
+            stays = available_stays(cabin, nights=args.nights or (2 if args.weekend else 1),
+                                    min_beds=args.min_beds or 1, weekend=args.weekend,
+                                    whole_cabin=args.whole_cabin, include_unreleased=args.include_unreleased)
+            if not stays:
+                continue
+            record["matching_stays"] = stays
+        records.append(record)
+    output = {"fetched_at": datetime.now(timezone.utc).isoformat(),
+              "date": None if args.date_from else start, "date_from": start, "date_to": end,
+              "season": args.season, "strict_time_limits": args.strict_time_limits,
+              "total_cabins": len(records), "warnings": client.warnings,
+              "availability_note": "Listed beds on unreleased dates are not bookable now. Dates are overnight dates; checkout follows the last night. Check cabin notices and transport timetables.",
+              "cabins": records}
     json.dump(output, sys.stdout, indent=2, ensure_ascii=False)
     print()
 
