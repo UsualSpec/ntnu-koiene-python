@@ -7,7 +7,7 @@ no linter/CI config, no git repo.
 ## Run
 
 Dependencies are pinned in `requirements.txt`. A uv-managed venv (Python 3.13)
-already exists — use it, don't rely on `python` being on PATH:
+should be created if needed — use it, don't rely on `python` being on PATH:
 
 ```sh
 .venv/bin/python koiene_cli.py --date 2026-08-18 --available-only
